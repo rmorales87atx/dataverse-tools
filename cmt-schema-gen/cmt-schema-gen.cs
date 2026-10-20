@@ -1,0 +1,559 @@
+#:property UseAppHost=false
+#:property PublishAot=false
+#:property Nullable=enable
+#:property ImplicitUsings=enable
+
+// cmt-schema-gen.cs
+// Generates a Configuration Migration Tool (CMT) data_schema.xml from live
+// Dataverse metadata, for use with `pac data export --schemaFile`.
+//
+// No NuGet packages. Runs under the approved dotnet.exe (UseAppHost=false),
+// so no unapproved EXE is produced.
+//
+// Usage:
+//   dotnet run cmt-schema-gen.cs -- --url https://org.crm9.dynamics.com --entities account,contact
+//   dotnet run cmt-schema-gen.cs -- --url https://org.crm9.dynamics.com --solution MyConfigSolution
+//
+// Options:
+//   --url <org url>            Dataverse org URL (required)
+//   --entities <a,b,c>         Comma-separated table logical names
+//   --solution <uniquename>    Add every table in this solution
+//   --out <path>               Output file (default: data_schema.xml)
+//   --exclude-fields <a,b>     Field logical names to drop from every table
+//   --no-owner                 Drop ownerid (useful when users differ across environments)
+//   --all-m2m                  Include N:N relationships even when the other table is not in the schema
+//   --disable-plugins          Set disableplugins="true" on every entity
+//   --tenant <id|domain>       Entra tenant (default: organizations)
+//   --client-id <guid>         Public client app ID (default: Microsoft's Dataverse sample app)
+//
+// Auth: device code flow against login.microsoftonline.com (correct for GCC Moderate).
+// Set DATAVERSE_TOKEN to skip sign-in and use a bearer token you already have.
+
+using System.Net.Http.Headers;
+using System.Text;
+using System.Text.Json;
+using System.Xml;
+using System.Xml.Linq;
+
+namespace CmtSchemaGen;
+
+internal static class Program {
+    private const string DefaultClientId = "51f81489-12ee-4a9e-aaae-a2591f45987d";
+
+    public static async Task<int> Main(string[] args) {
+        Options options;
+        try {
+            options = Options.Parse(args);
+        } catch (ArgumentException ex) {
+            Console.Error.WriteLine($"error: {ex.Message}");
+            Console.Error.WriteLine("usage: dotnet run cmt-schema-gen.cs -- --url <org url> (--entities a,b | --solution name) [--out data_schema.xml]");
+            return 2;
+        }
+
+        try {
+            var token = Environment.GetEnvironmentVariable("DATAVERSE_TOKEN");
+            if (string.IsNullOrWhiteSpace(token)) {
+                token = await DeviceCodeAuth.GetTokenAsync(options.Url, options.Tenant, options.ClientId ?? DefaultClientId);
+            }
+
+            using var api = new DataverseApi(options.Url, token);
+
+            var logicalNames = new SortedSet<string>(options.Entities, StringComparer.OrdinalIgnoreCase);
+            if (options.Solution is not null) {
+                foreach (var name in await api.GetSolutionTableNamesAsync(options.Solution)) {
+                    logicalNames.Add(name);
+                }
+            }
+
+            if (logicalNames.Count == 0) {
+                Console.Error.WriteLine("error: no tables selected. Pass --entities or --solution.");
+                return 2;
+            }
+
+            var tables = new List<TableMeta>();
+            foreach (var name in logicalNames) {
+                Console.Error.WriteLine($"reading metadata: {name}");
+                tables.Add(await api.GetTableAsync(name));
+            }
+
+            var schema = SchemaWriter.Build(tables, options, await ResolveM2MTargetKeysAsync(api, tables, options));
+            var settings = new XmlWriterSettings { Indent = true, OmitXmlDeclaration = false, Encoding = new UTF8Encoding(false) };
+            using (var writer = XmlWriter.Create(options.OutPath, settings)) {
+                schema.Save(writer);
+            }
+
+            Console.Error.WriteLine($"wrote {options.OutPath} ({tables.Count} tables)");
+            return 0;
+        } catch (DataverseException ex) {
+            Console.Error.WriteLine($"error: {ex.Message}");
+            return 1;
+        }
+    }
+
+    private static async Task<Dictionary<string, string>> ResolveM2MTargetKeysAsync(DataverseApi api, List<TableMeta> tables, Options options) {
+        // Primary key of each N:N target table. Tables already loaded need no extra call.
+        var keys = tables.ToDictionary(t => t.LogicalName, t => t.PrimaryIdAttribute, StringComparer.OrdinalIgnoreCase);
+        if (!options.AllM2M) {
+            return keys;
+        }
+
+        foreach (var rel in tables.SelectMany(t => t.ManyToMany.Select(r => r.TargetFor(t.LogicalName)))) {
+            if (!keys.ContainsKey(rel)) {
+                keys[rel] = await api.GetPrimaryIdAttributeAsync(rel);
+            }
+        }
+
+        return keys;
+    }
+}
+
+internal sealed class Options {
+    public string Url { get; private set; } = "";
+
+    public List<string> Entities { get; } = [];
+
+    public string? Solution { get; private set; }
+
+    public string OutPath { get; private set; } = "data_schema.xml";
+
+    public HashSet<string> ExcludeFields { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public bool NoOwner { get; private set; }
+
+    public bool AllM2M { get; private set; }
+
+    public bool DisablePlugins { get; private set; }
+
+    public string Tenant { get; private set; } = "organizations";
+
+    public string? ClientId { get; private set; }
+
+    public static Options Parse(string[] args) {
+        var o = new Options();
+        for (var i = 0; i < args.Length; i++) {
+            var arg = args[i];
+            string Next() {
+                if ((i + 1) >= args.Length) {
+                    throw new ArgumentException($"{arg} needs a value");
+                }
+
+                return args[++i];
+            }
+
+            switch (arg) {
+                case "--url":
+                    o.Url = Next().TrimEnd('/');
+                    break;
+                case "--entities":
+                    o.Entities.AddRange(SplitList(Next()));
+                    break;
+                case "--solution":
+                    o.Solution = Next();
+                    break;
+                case "--out":
+                    o.OutPath = Next();
+                    break;
+                case "--exclude-fields":
+                    foreach (var f in SplitList(Next())) {
+                        o.ExcludeFields.Add(f);
+                    }
+
+                    break;
+                case "--no-owner":
+                    o.NoOwner = true;
+                    break;
+                case "--all-m2m":
+                    o.AllM2M = true;
+                    break;
+                case "--disable-plugins":
+                    o.DisablePlugins = true;
+                    break;
+                case "--tenant":
+                    o.Tenant = Next();
+                    break;
+                case "--client-id":
+                    o.ClientId = Next();
+                    break;
+                default:
+                    throw new ArgumentException($"unknown option {arg}");
+            }
+        }
+
+        if (string.IsNullOrWhiteSpace(o.Url)) {
+            throw new ArgumentException("--url is required");
+        }
+
+        return o;
+    }
+
+    private static IEnumerable<string> SplitList(string value) {
+        return value.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries)
+            .Select(s => s.ToLowerInvariant());
+    }
+}
+
+internal sealed record TableMeta(
+    string LogicalName,
+    string DisplayName,
+    int ObjectTypeCode,
+    string PrimaryIdAttribute,
+    string? PrimaryNameAttribute,
+    List<AttributeMeta> Attributes,
+    List<ManyToManyMeta> ManyToMany);
+
+internal sealed record AttributeMeta(
+    string LogicalName,
+    string DisplayName,
+    string AttributeType,
+    string? AttributeTypeName,
+    bool IsValidForCreate,
+    bool IsValidForUpdate,
+    bool IsCustom,
+    bool IsPrimaryId,
+    string? AttributeOf,
+    List<string> Targets);
+
+internal sealed record ManyToManyMeta(
+    string SchemaName,
+    string IntersectEntityName,
+    string Entity1LogicalName,
+    string Entity2LogicalName) {
+    public bool IsReflexive => string.Equals(Entity1LogicalName, Entity2LogicalName, StringComparison.OrdinalIgnoreCase);
+
+    public string TargetFor(string table) {
+        return string.Equals(Entity1LogicalName, table, StringComparison.OrdinalIgnoreCase) ? Entity2LogicalName : Entity1LogicalName;
+    }
+}
+
+internal static class SchemaWriter {
+    // Dataverse AttributeType -> CMT schema field type.
+    // Types not listed (Virtual, EntityName, ManagedProperty, CalendarRules,
+    // File, Image, MultiSelectPicklist) are skipped and reported.
+    private static readonly Dictionary<string, string> TypeMap = new(StringComparer.OrdinalIgnoreCase) {
+        ["String"] = "string",
+        ["Memo"] = "string",
+        ["Uniqueidentifier"] = "guid",
+        ["Lookup"] = "entityreference",
+        ["Customer"] = "entityreference",
+        ["Owner"] = "owner",
+        ["PartyList"] = "partylist",
+        ["Picklist"] = "optionsetvalue",
+        ["State"] = "state",
+        ["Status"] = "status",
+        ["Boolean"] = "bool",
+        ["DateTime"] = "datetime",
+        ["Decimal"] = "decimal",
+        ["Double"] = "float",
+        ["Money"] = "money",
+        ["Integer"] = "number",
+        ["BigInt"] = "bigint",
+    };
+
+    public static XDocument Build(List<TableMeta> tables, Options options, Dictionary<string, string> primaryKeys) {
+        var root = new XElement("entities");
+        var inSchema = tables.Select(t => t.LogicalName).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var table in tables) {
+            root.Add(BuildEntity(table, options, primaryKeys, inSchema));
+        }
+
+        return new XDocument(new XDeclaration("1.0", "utf-8", null), root);
+    }
+
+    private static XElement BuildEntity(TableMeta table, Options options, Dictionary<string, string> primaryKeys, HashSet<string> inSchema) {
+        var entity = new XElement("entity",
+            new XAttribute("name", table.LogicalName),
+            new XAttribute("displayname", table.DisplayName),
+            new XAttribute("etc", table.ObjectTypeCode),
+            new XAttribute("primaryidfield", table.PrimaryIdAttribute),
+            new XAttribute("primarynamefield", table.PrimaryNameAttribute ?? ""),
+            new XAttribute("disableplugins", options.DisablePlugins ? "true" : "false"));
+
+        var fields = new XElement("fields");
+        var skipped = new List<string>();
+        foreach (var attr in table.Attributes.OrderBy(a => a.LogicalName, StringComparer.Ordinal)) {
+            if (!Include(attr, options)) {
+                continue;
+            }
+
+            if (!TypeMap.TryGetValue(attr.AttributeType, out var cmtType)) {
+                skipped.Add($"{attr.LogicalName} ({attr.AttributeTypeName ?? attr.AttributeType})");
+                continue;
+            }
+
+            var field = new XElement("field",
+                new XAttribute("displayname", attr.DisplayName),
+                new XAttribute("name", attr.LogicalName),
+                new XAttribute("type", cmtType));
+
+            if ((cmtType is "entityreference" or "owner" or "partylist") && (attr.Targets.Count > 0)) {
+                field.Add(new XAttribute("lookupType", string.Join('|', attr.Targets)));
+            }
+
+            if (attr.IsCustom) {
+                field.Add(new XAttribute("customfield", "true"));
+            }
+
+            if (attr.IsPrimaryId) {
+                field.Add(new XAttribute("primaryKey", "true"));
+            }
+
+            fields.Add(field);
+        }
+
+        if (skipped.Count > 0) {
+            Console.Error.WriteLine($"  {table.LogicalName}: skipped unsupported types: {string.Join(", ", skipped)}");
+        }
+
+        entity.Add(fields);
+
+        var relationships = new XElement("relationships");
+        foreach (var rel in table.ManyToMany.OrderBy(r => r.SchemaName, StringComparer.Ordinal)) {
+            var target = rel.TargetFor(table.LogicalName);
+            if (!primaryKeys.TryGetValue(target, out var targetKey)) {
+                continue;
+            }
+
+            // When both tables are in the schema, list the N:N once (on Entity1) so the import does not associate twice.
+            if (!string.Equals(rel.Entity1LogicalName, table.LogicalName, StringComparison.OrdinalIgnoreCase)
+                && inSchema.Contains(rel.Entity1LogicalName)) {
+                continue;
+            }
+
+            relationships.Add(new XElement("relationship",
+                new XAttribute("name", rel.SchemaName),
+                new XAttribute("manyToMany", "true"),
+                new XAttribute("isreflexive", rel.IsReflexive ? "true" : "false"),
+                new XAttribute("relatedEntityName", rel.IntersectEntityName),
+                new XAttribute("m2mTargetEntity", target),
+                new XAttribute("m2mTargetEntityPrimaryKey", targetKey)));
+        }
+
+        entity.Add(relationships);
+        return entity;
+    }
+
+    private static bool Include(AttributeMeta attr, Options options) {
+        if (attr.IsPrimaryId) {
+            return true;
+        }
+
+        if (attr.AttributeOf is not null) {
+            return false; // yomi names, lookup name shadows, and similar
+        }
+
+        if (!attr.IsValidForCreate && !attr.IsValidForUpdate) {
+            return false; // createdon, modifiedby, versionnumber, rollups, calculated
+        }
+
+        if (options.ExcludeFields.Contains(attr.LogicalName)) {
+            return false;
+        }
+
+        if (options.NoOwner && (attr.LogicalName == "ownerid")) {
+            return false;
+        }
+
+        return true;
+    }
+}
+
+internal sealed class DataverseException(string message) : Exception(message);
+
+internal sealed class DataverseApi : IDisposable {
+    private readonly HttpClient _http;
+
+    public DataverseApi(string orgUrl, string token) {
+        _http = new HttpClient { BaseAddress = new Uri($"{orgUrl}/api/data/v9.2/") };
+        _http.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
+        _http.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+        _http.DefaultRequestHeaders.Add("OData-MaxVersion", "4.0");
+        _http.DefaultRequestHeaders.Add("OData-Version", "4.0");
+    }
+
+    public void Dispose() {
+        _http.Dispose();
+    }
+
+    public async Task<TableMeta> GetTableAsync(string logicalName) {
+        var path = $"EntityDefinitions(LogicalName='{logicalName}')"
+            + "?$select=LogicalName,DisplayName,ObjectTypeCode,PrimaryIdAttribute,PrimaryNameAttribute"
+            + "&$expand=Attributes($select=LogicalName,DisplayName,AttributeType,AttributeTypeName,IsValidForCreate,IsValidForUpdate,IsCustomAttribute,IsPrimaryId,AttributeOf),"
+            + "ManyToManyRelationships($select=SchemaName,IntersectEntityName,Entity1LogicalName,Entity2LogicalName)";
+
+        using var doc = await GetJsonAsync(path);
+        var e = doc.RootElement;
+
+        var targets = await GetLookupTargetsAsync(logicalName);
+
+        var attributes = e.GetProperty("Attributes").EnumerateArray().Select(a => {
+            var name = a.GetProperty("LogicalName").GetString()!;
+            return new AttributeMeta(
+                name,
+                Label(a, "DisplayName") ?? name,
+                a.GetProperty("AttributeType").GetString() ?? "",
+                a.TryGetProperty("AttributeTypeName", out var tn) && tn.ValueKind == JsonValueKind.Object ? tn.GetProperty("Value").GetString() : null,
+                ManagedBool(a, "IsValidForCreate"),
+                ManagedBool(a, "IsValidForUpdate"),
+                ManagedBool(a, "IsCustomAttribute"),
+                ManagedBool(a, "IsPrimaryId"),
+                a.TryGetProperty("AttributeOf", out var of) && of.ValueKind == JsonValueKind.String ? of.GetString() : null,
+                targets.TryGetValue(name, out var t) ? t : []);
+        }).ToList();
+
+        var m2m = e.GetProperty("ManyToManyRelationships").EnumerateArray().Select(r => new ManyToManyMeta(
+            r.GetProperty("SchemaName").GetString()!,
+            r.GetProperty("IntersectEntityName").GetString()!,
+            r.GetProperty("Entity1LogicalName").GetString()!,
+            r.GetProperty("Entity2LogicalName").GetString()!)).ToList();
+
+        return new TableMeta(
+            e.GetProperty("LogicalName").GetString()!,
+            Label(e, "DisplayName") ?? logicalName,
+            e.GetProperty("ObjectTypeCode").GetInt32(),
+            e.GetProperty("PrimaryIdAttribute").GetString()!,
+            e.TryGetProperty("PrimaryNameAttribute", out var pn) && pn.ValueKind == JsonValueKind.String ? pn.GetString() : null,
+            attributes,
+            m2m);
+    }
+
+    public async Task<string> GetPrimaryIdAttributeAsync(string logicalName) {
+        using var doc = await GetJsonAsync($"EntityDefinitions(LogicalName='{logicalName}')?$select=PrimaryIdAttribute");
+        return doc.RootElement.GetProperty("PrimaryIdAttribute").GetString()!;
+    }
+
+    public async Task<List<string>> GetSolutionTableNamesAsync(string uniqueName) {
+        var escaped = uniqueName.Replace("'", "''");
+        using var sol = await GetJsonAsync($"solutions?$select=solutionid&$filter=uniquename eq '{escaped}'");
+        var rows = sol.RootElement.GetProperty("value");
+        if (rows.GetArrayLength() == 0) {
+            throw new DataverseException($"solution '{uniqueName}' not found");
+        }
+
+        var solutionId = rows[0].GetProperty("solutionid").GetString();
+        using var comps = await GetJsonAsync($"solutioncomponents?$select=objectid&$filter=_solutionid_value eq {solutionId} and componenttype eq 1");
+
+        var names = new List<string>();
+        foreach (var c in comps.RootElement.GetProperty("value").EnumerateArray()) {
+            var metadataId = c.GetProperty("objectid").GetString();
+            using var def = await GetJsonAsync($"EntityDefinitions({metadataId})?$select=LogicalName");
+            names.Add(def.RootElement.GetProperty("LogicalName").GetString()!);
+        }
+
+        Console.Error.WriteLine($"solution {uniqueName}: {names.Count} tables");
+        return names;
+    }
+
+    private async Task<Dictionary<string, List<string>>> GetLookupTargetsAsync(string logicalName) {
+        // Targets live only on LookupAttributeMetadata (Lookup, Customer, Owner, PartyList all derive from it).
+        using var doc = await GetJsonAsync(
+            $"EntityDefinitions(LogicalName='{logicalName}')/Attributes/Microsoft.Dynamics.CRM.LookupAttributeMetadata?$select=LogicalName,Targets");
+
+        var result = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        foreach (var a in doc.RootElement.GetProperty("value").EnumerateArray()) {
+            var targets = a.TryGetProperty("Targets", out var t) && t.ValueKind == JsonValueKind.Array
+                ? t.EnumerateArray().Select(x => x.GetString()!).ToList()
+                : [];
+            result[a.GetProperty("LogicalName").GetString()!] = targets;
+        }
+
+        return result;
+    }
+
+    private async Task<JsonDocument> GetJsonAsync(string path) {
+        using var response = await _http.GetAsync(path);
+        var body = await response.Content.ReadAsStringAsync();
+        if (!response.IsSuccessStatusCode) {
+            var detail = TryGetODataError(body) ?? body;
+            throw new DataverseException($"{(int)response.StatusCode} {response.StatusCode} on {path}: {detail}");
+        }
+
+        return JsonDocument.Parse(body);
+    }
+
+    private static string? TryGetODataError(string body) {
+        try {
+            using var doc = JsonDocument.Parse(body);
+            return doc.RootElement.GetProperty("error").GetProperty("message").GetString();
+        } catch (Exception ex) when (ex is JsonException or KeyNotFoundException or InvalidOperationException) {
+            return null;
+        }
+    }
+
+    private static string? Label(JsonElement e, string property) {
+        if (!e.TryGetProperty(property, out var label) || (label.ValueKind != JsonValueKind.Object)) {
+            return null;
+        }
+
+        if (label.TryGetProperty("UserLocalizedLabel", out var ul) && (ul.ValueKind == JsonValueKind.Object)) {
+            return ul.GetProperty("Label").GetString();
+        }
+
+        return null;
+    }
+
+    private static bool ManagedBool(JsonElement e, string property) {
+        if (!e.TryGetProperty(property, out var v)) {
+            return false;
+        }
+
+        return v.ValueKind switch {
+            JsonValueKind.True => true,
+            JsonValueKind.Object => v.TryGetProperty("Value", out var inner) && (inner.ValueKind == JsonValueKind.True),
+            _ => false,
+        };
+    }
+}
+
+internal static class DeviceCodeAuth {
+    public static async Task<string> GetTokenAsync(string orgUrl, string tenant, string clientId) {
+        using var http = new HttpClient();
+        var authority = $"https://login.microsoftonline.com/{tenant}/oauth2/v2.0";
+        var scope = $"{orgUrl}/user_impersonation offline_access";
+
+        using var codeResponse = await http.PostAsync($"{authority}/devicecode", new FormUrlEncodedContent(new Dictionary<string, string> {
+            ["client_id"] = clientId,
+            ["scope"] = scope,
+        }));
+        using var codeDoc = JsonDocument.Parse(await codeResponse.Content.ReadAsStringAsync());
+        var code = codeDoc.RootElement;
+        if (!codeResponse.IsSuccessStatusCode) {
+            throw new DataverseException($"device code request failed: {code.GetProperty("error_description").GetString()}");
+        }
+
+        Console.Error.WriteLine(code.GetProperty("message").GetString());
+
+        var deviceCode = code.GetProperty("device_code").GetString()!;
+        var interval = code.GetProperty("interval").GetInt32();
+        var deadline = DateTime.UtcNow.AddSeconds(code.GetProperty("expires_in").GetInt32());
+
+        while (DateTime.UtcNow < deadline) {
+            await Task.Delay(TimeSpan.FromSeconds(interval));
+
+            using var tokenResponse = await http.PostAsync($"{authority}/token", new FormUrlEncodedContent(new Dictionary<string, string> {
+                ["grant_type"] = "urn:ietf:params:oauth:grant-type:device_code",
+                ["client_id"] = clientId,
+                ["device_code"] = deviceCode,
+            }));
+            using var tokenDoc = JsonDocument.Parse(await tokenResponse.Content.ReadAsStringAsync());
+            var t = tokenDoc.RootElement;
+
+            if (tokenResponse.IsSuccessStatusCode) {
+                return t.GetProperty("access_token").GetString()!;
+            }
+
+            var error = t.GetProperty("error").GetString();
+            if (error == "authorization_pending") {
+                continue;
+            }
+
+            if (error == "slow_down") {
+                interval += 5;
+                continue;
+            }
+
+            throw new DataverseException($"sign-in failed: {t.GetProperty("error_description").GetString()}");
+        }
+
+        throw new DataverseException("sign-in timed out");
+    }
+}
