@@ -31,14 +31,38 @@ pac data export --schemaFile data_schema.xml --dataFile data.zip
 | `--disable-plugins` | Set `disableplugins="true"` on every entity |
 | `--tenant <id\|domain>` | Entra tenant (default `organizations`) |
 | `--client-id <guid>` | Public client app ID (default: Microsoft's Dataverse sample app) |
+| `--authority-host <url>` | Entra host (default `https://login.microsoftonline.com`) |
+| `--no-cache` | Do not read or save the sign-in cache |
+| `--logout` | Delete the sign-in cache and exit |
 
 `--entities` and `--solution` can be combined.
 
 ## Authentication
 
 Device code flow against `login.microsoftonline.com` (correct for commercial
-and GCC Moderate). If Conditional Access blocks device code sign-in, set
+and GCC Moderate; use `--authority-host https://login.microsoftonline.us` for
+GCC High). If Conditional Access blocks device code sign-in, set
 `DATAVERSE_TOKEN` to a bearer token for the org and the tool skips sign-in.
+
+### Sign-in cache
+
+After the first device code sign-in, the refresh token is saved and later runs
+sign in silently. The token is rotated on every run, so regular use keeps it
+alive until your tenant's policy forces a new sign-in.
+
+- Location: `%LOCALAPPDATA%\cmt-schema-gen\tokens.bin` (`~/.local/share/...` on Linux/macOS)
+- Windows: encrypted with DPAPI, current-user scope. Only your Windows account on that machine can read it.
+- Linux/macOS: plain JSON with file mode `0600`.
+- One entry per authority host + tenant + client ID + org URL.
+- An expired, revoked, or unreadable entry is discarded and you get a device code prompt again.
+
+| Option | Meaning |
+|---|---|
+| `--no-cache` | Do not read or save the cache for this run |
+| `--logout` | Delete the cache file and exit (no `--url` needed) |
+
+The cache holds a credential. Delete it with `--logout` on any shared or
+temporary machine.
 
 ## Field selection
 
@@ -56,6 +80,9 @@ schema.
 
 ## Status
 
-Tested against a mock Web API. Not yet verified against a schema produced by
-the CMT GUI. Diff the output against a known-good CMT schema before relying
-on it.
+Schema generation used successfully against a real GCC Moderate environment.
+Not yet diffed against a schema produced by the CMT GUI.
+
+The sign-in cache is tested against a mock token endpoint (silent refresh,
+token rotation, revoked token, corrupt cache, logout). The DPAPI path is
+Windows-only and is not covered by those tests.

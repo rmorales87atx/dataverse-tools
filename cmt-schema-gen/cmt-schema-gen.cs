@@ -25,11 +25,19 @@
 //   --disable-plugins          Set disableplugins="true" on every entity
 //   --tenant <id|domain>       Entra tenant (default: organizations)
 //   --client-id <guid>         Public client app ID (default: Microsoft's Dataverse sample app)
+//   --authority-host <url>     Entra host (default: https://login.microsoftonline.com; GCC High: https://login.microsoftonline.us)
+//   --no-cache                 Do not read or save the sign-in cache
+//   --logout                   Delete the sign-in cache and exit
 //
-// Auth: device code flow against login.microsoftonline.com (correct for GCC Moderate).
+// Auth: device code flow. The refresh token is saved per org/tenant/client so later
+// runs sign in silently. On Windows the cache is encrypted with DPAPI (current user);
+// elsewhere it is a 0600 file. Cache: %LOCALAPPDATA%\cmt-schema-gen\tokens.bin
 // Set DATAVERSE_TOKEN to skip sign-in and use a bearer token you already have.
 
+using System.ComponentModel;
 using System.Net.Http.Headers;
+using System.Runtime.InteropServices;
+using System.Runtime.Versioning;
 using System.Text;
 using System.Text.Json;
 using System.Xml;
@@ -50,10 +58,17 @@ internal static class Program {
             return 2;
         }
 
+        if (options.Logout) {
+            TokenCache.Clear();
+            Console.Error.WriteLine($"deleted sign-in cache: {TokenCache.FilePath}");
+            return 0;
+        }
+
         try {
             var token = Environment.GetEnvironmentVariable("DATAVERSE_TOKEN");
             if (string.IsNullOrWhiteSpace(token)) {
-                token = await DeviceCodeAuth.GetTokenAsync(options.Url, options.Tenant, options.ClientId ?? DefaultClientId);
+                var auth = new Authenticator(options.AuthorityHost, options.Tenant, options.ClientId ?? DefaultClientId, options.Url);
+                token = await auth.GetAccessTokenAsync(options.UseCache);
             }
 
             using var api = new DataverseApi(options.Url, token);
@@ -128,6 +143,12 @@ internal sealed class Options {
 
     public string? ClientId { get; private set; }
 
+    public string AuthorityHost { get; private set; } = "https://login.microsoftonline.com";
+
+    public bool UseCache { get; private set; } = true;
+
+    public bool Logout { get; private set; }
+
     public static Options Parse(string[] args) {
         var o = new Options();
         for (var i = 0; i < args.Length; i++) {
@@ -174,12 +195,21 @@ internal sealed class Options {
                 case "--client-id":
                     o.ClientId = Next();
                     break;
+                case "--authority-host":
+                    o.AuthorityHost = Next().TrimEnd('/');
+                    break;
+                case "--no-cache":
+                    o.UseCache = false;
+                    break;
+                case "--logout":
+                    o.Logout = true;
+                    break;
                 default:
                     throw new ArgumentException($"unknown option {arg}");
             }
         }
 
-        if (string.IsNullOrWhiteSpace(o.Url)) {
+        if (string.IsNullOrWhiteSpace(o.Url) && !o.Logout) {
             throw new ArgumentException("--url is required");
         }
 
@@ -504,15 +534,57 @@ internal sealed class DataverseApi : IDisposable {
     }
 }
 
-internal static class DeviceCodeAuth {
-    public static async Task<string> GetTokenAsync(string orgUrl, string tenant, string clientId) {
-        using var http = new HttpClient();
-        var authority = $"https://login.microsoftonline.com/{tenant}/oauth2/v2.0";
-        var scope = $"{orgUrl}/user_impersonation offline_access";
+internal sealed record TokenResult(string AccessToken, string? RefreshToken);
 
-        using var codeResponse = await http.PostAsync($"{authority}/devicecode", new FormUrlEncodedContent(new Dictionary<string, string> {
-            ["client_id"] = clientId,
-            ["scope"] = scope,
+internal sealed class Authenticator {
+    private readonly string _endpoint;
+    private readonly string _clientId;
+    private readonly string _scope;
+    private readonly string _cacheKey;
+
+    public Authenticator(string authorityHost, string tenant, string clientId, string orgUrl) {
+        _endpoint = $"{authorityHost}/{tenant}/oauth2/v2.0";
+        _clientId = clientId;
+        _scope = $"{orgUrl}/user_impersonation offline_access";
+        _cacheKey = $"{authorityHost}|{tenant}|{clientId}|{orgUrl}".ToLowerInvariant();
+    }
+
+    public async Task<string> GetAccessTokenAsync(bool useCache) {
+        using var http = new HttpClient();
+
+        if (useCache) {
+            var refreshToken = TokenCache.Read(_cacheKey);
+            if (refreshToken is not null) {
+                var (result, error) = await RedeemAsync(http, new Dictionary<string, string> {
+                    ["grant_type"] = "refresh_token",
+                    ["client_id"] = _clientId,
+                    ["refresh_token"] = refreshToken,
+                    ["scope"] = _scope,
+                });
+
+                if (result is not null) {
+                    // Entra rotates refresh tokens; save the new one so the sliding window keeps moving.
+                    TokenCache.Write(_cacheKey, result.RefreshToken ?? refreshToken);
+                    return result.AccessToken;
+                }
+
+                Console.Error.WriteLine($"saved sign-in not accepted ({error}); signing in again");
+                TokenCache.Remove(_cacheKey);
+            }
+        }
+
+        var fresh = await DeviceCodeAsync(http);
+        if (useCache && (fresh.RefreshToken is not null)) {
+            TokenCache.Write(_cacheKey, fresh.RefreshToken);
+        }
+
+        return fresh.AccessToken;
+    }
+
+    private async Task<TokenResult> DeviceCodeAsync(HttpClient http) {
+        using var codeResponse = await http.PostAsync($"{_endpoint}/devicecode", new FormUrlEncodedContent(new Dictionary<string, string> {
+            ["client_id"] = _clientId,
+            ["scope"] = _scope,
         }));
         using var codeDoc = JsonDocument.Parse(await codeResponse.Content.ReadAsStringAsync());
         var code = codeDoc.RootElement;
@@ -529,19 +601,16 @@ internal static class DeviceCodeAuth {
         while (DateTime.UtcNow < deadline) {
             await Task.Delay(TimeSpan.FromSeconds(interval));
 
-            using var tokenResponse = await http.PostAsync($"{authority}/token", new FormUrlEncodedContent(new Dictionary<string, string> {
+            var (result, error) = await RedeemAsync(http, new Dictionary<string, string> {
                 ["grant_type"] = "urn:ietf:params:oauth:grant-type:device_code",
-                ["client_id"] = clientId,
+                ["client_id"] = _clientId,
                 ["device_code"] = deviceCode,
-            }));
-            using var tokenDoc = JsonDocument.Parse(await tokenResponse.Content.ReadAsStringAsync());
-            var t = tokenDoc.RootElement;
+            });
 
-            if (tokenResponse.IsSuccessStatusCode) {
-                return t.GetProperty("access_token").GetString()!;
+            if (result is not null) {
+                return result;
             }
 
-            var error = t.GetProperty("error").GetString();
             if (error == "authorization_pending") {
                 continue;
             }
@@ -551,9 +620,158 @@ internal static class DeviceCodeAuth {
                 continue;
             }
 
-            throw new DataverseException($"sign-in failed: {t.GetProperty("error_description").GetString()}");
+            throw new DataverseException($"sign-in failed: {error}");
         }
 
         throw new DataverseException("sign-in timed out");
+    }
+
+    private async Task<(TokenResult? Result, string? Error)> RedeemAsync(HttpClient http, Dictionary<string, string> form) {
+        using var response = await http.PostAsync($"{_endpoint}/token", new FormUrlEncodedContent(form));
+        using var doc = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+        var t = doc.RootElement;
+
+        if (response.IsSuccessStatusCode) {
+            var refresh = t.TryGetProperty("refresh_token", out var r) ? r.GetString() : null;
+            return (new TokenResult(t.GetProperty("access_token").GetString()!, refresh), null);
+        }
+
+        var error = t.TryGetProperty("error", out var e) ? e.GetString() : "unknown_error";
+        if ((error is not "authorization_pending" and not "slow_down") && t.TryGetProperty("error_description", out var d)) {
+            error = $"{error}: {FirstLine(d.GetString())}";
+        }
+
+        return (null, error);
+    }
+
+    private static string FirstLine(string? text) {
+        return (text ?? "").Split('\n', 2)[0].Trim();
+    }
+}
+
+internal static class TokenCache {
+    public static readonly string FilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData, Environment.SpecialFolderOption.Create),
+        "cmt-schema-gen",
+        "tokens.bin");
+
+    public static string? Read(string key) {
+        return Load().TryGetValue(key, out var value) ? value : null;
+    }
+
+    public static void Write(string key, string refreshToken) {
+        var entries = Load();
+        entries[key] = refreshToken;
+        Save(entries);
+    }
+
+    public static void Remove(string key) {
+        var entries = Load();
+        if (entries.Remove(key)) {
+            Save(entries);
+        }
+    }
+
+    public static void Clear() {
+        if (File.Exists(FilePath)) {
+            File.Delete(FilePath);
+        }
+    }
+
+    private static Dictionary<string, string> Load() {
+        if (!File.Exists(FilePath)) {
+            return [];
+        }
+
+        try {
+            var bytes = File.ReadAllBytes(FilePath);
+            var json = OperatingSystem.IsWindows() ? Dpapi.Unprotect(bytes) : bytes;
+            return JsonSerializer.Deserialize<Dictionary<string, string>>(json) ?? [];
+        } catch (Exception ex) when (ex is JsonException or Win32Exception or IOException) {
+            // Unreadable cache (another user, another machine, or corrupt): start over.
+            Console.Error.WriteLine($"ignoring unreadable sign-in cache: {ex.Message}");
+            return [];
+        }
+    }
+
+    private static void Save(Dictionary<string, string> entries) {
+        var json = JsonSerializer.SerializeToUtf8Bytes(entries);
+        var bytes = OperatingSystem.IsWindows() ? Dpapi.Protect(json) : json;
+
+        Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
+        var temp = FilePath + ".tmp";
+        var fileOptions = new FileStreamOptions { Mode = FileMode.Create, Access = FileAccess.Write };
+        if (!OperatingSystem.IsWindows()) {
+            fileOptions.UnixCreateMode = UnixFileMode.UserRead | UnixFileMode.UserWrite;
+        }
+
+        using (var stream = new FileStream(temp, fileOptions)) {
+            stream.Write(bytes);
+        }
+
+        File.Move(temp, FilePath, overwrite: true);
+    }
+}
+
+[SupportedOSPlatform("windows")]
+internal static class Dpapi {
+    private const int CryptProtectUiForbidden = 0x1;
+
+    public static byte[] Protect(byte[] data) {
+        return Transform(data, protect: true);
+    }
+
+    public static byte[] Unprotect(byte[] data) {
+        return Transform(data, protect: false);
+    }
+
+    private static byte[] Transform(byte[] data, bool protect) {
+        var handle = GCHandle.Alloc(data, GCHandleType.Pinned);
+        try {
+            var input = new DataBlob(data.Length, handle.AddrOfPinnedObject());
+            var output = new DataBlob(0, IntPtr.Zero);
+            var ok = protect
+                ? CryptProtectData(ref input, "cmt-schema-gen", IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, CryptProtectUiForbidden, ref output)
+                : CryptUnprotectData(ref input, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, CryptProtectUiForbidden, ref output);
+            if (!ok) {
+                throw new Win32Exception(Marshal.GetLastWin32Error());
+            }
+
+            try {
+                var result = new byte[output.Length];
+                Marshal.Copy(output.Pointer, result, 0, output.Length);
+                return result;
+            } finally {
+                LocalFree(output.Pointer);
+            }
+        } finally {
+            handle.Free();
+        }
+    }
+
+    [DllImport("crypt32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CryptProtectData(
+        ref DataBlob dataIn, string? description, IntPtr entropy, IntPtr reserved, IntPtr prompt, int flags, ref DataBlob dataOut);
+
+    [DllImport("crypt32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CryptUnprotectData(
+        ref DataBlob dataIn, IntPtr description, IntPtr entropy, IntPtr reserved, IntPtr prompt, int flags, ref DataBlob dataOut);
+
+    [DllImport("kernel32.dll")]
+    private static extern IntPtr LocalFree(IntPtr handle);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct DataBlob {
+        private int _length;
+        private IntPtr _pointer;
+
+        public DataBlob(int length, IntPtr pointer) {
+            _length = length;
+            _pointer = pointer;
+        }
+
+        public readonly int Length => _length;
+
+        public readonly IntPtr Pointer => _pointer;
     }
 }
