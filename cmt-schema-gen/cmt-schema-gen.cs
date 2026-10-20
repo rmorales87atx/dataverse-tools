@@ -20,6 +20,8 @@
 //   --solution <uniquename>    Add every table in this solution
 //   --out <path>               Output file (default: data_schema.xml)
 //   --exclude-fields <a,b>     Field logical names to drop from every table
+//   --include-fields <a,b>     Field logical names to keep even if read-only (exclude wins)
+//   --include-audit            Keep createdon/createdby/modifiedon/modifiedby (+ onbehalfby); import ignores them
 //   --no-owner                 Drop ownerid (useful when users differ across environments)
 //   --all-m2m                  Include N:N relationships even when the other table is not in the schema
 //   --disable-plugins          Set disableplugins="true" on every entity
@@ -133,6 +135,10 @@ internal sealed class Options {
 
     public HashSet<string> ExcludeFields { get; } = new(StringComparer.OrdinalIgnoreCase);
 
+    public HashSet<string> IncludeFields { get; } = new(StringComparer.OrdinalIgnoreCase);
+
+    public bool IncludeAudit { get; private set; }
+
     public bool NoOwner { get; private set; }
 
     public bool AllM2M { get; private set; }
@@ -179,6 +185,15 @@ internal sealed class Options {
                         o.ExcludeFields.Add(f);
                     }
 
+                    break;
+                case "--include-fields":
+                    foreach (var f in SplitList(Next())) {
+                        o.IncludeFields.Add(f);
+                    }
+
+                    break;
+                case "--include-audit":
+                    o.IncludeAudit = true;
                     break;
                 case "--no-owner":
                     o.NoOwner = true;
@@ -362,8 +377,35 @@ internal static class SchemaWriter {
         return entity;
     }
 
+    // Read-only audit columns. Dataverse ignores them on import; overriddencreatedon
+    // (writable, so included by default) is the column that sets the created date.
+    private static readonly HashSet<string> AuditFields = new(StringComparer.OrdinalIgnoreCase) {
+        "createdon",
+        "createdby",
+        "createdonbehalfby",
+        "modifiedon",
+        "modifiedby",
+        "modifiedonbehalfby",
+    };
+
     private static bool Include(AttributeMeta attr, Options options) {
         if (attr.IsPrimaryId) {
+            return true;
+        }
+
+        if (options.ExcludeFields.Contains(attr.LogicalName)) {
+            return false;
+        }
+
+        if (options.NoOwner && (attr.LogicalName == "ownerid")) {
+            return false;
+        }
+
+        if (options.IncludeFields.Contains(attr.LogicalName)) {
+            return true;
+        }
+
+        if (options.IncludeAudit && AuditFields.Contains(attr.LogicalName)) {
             return true;
         }
 
@@ -373,14 +415,6 @@ internal static class SchemaWriter {
 
         if (!attr.IsValidForCreate && !attr.IsValidForUpdate) {
             return false; // createdon, modifiedby, versionnumber, rollups, calculated
-        }
-
-        if (options.ExcludeFields.Contains(attr.LogicalName)) {
-            return false;
-        }
-
-        if (options.NoOwner && (attr.LogicalName == "ownerid")) {
-            return false;
         }
 
         return true;

@@ -25,7 +25,9 @@ pac data export --schemaFile data_schema.xml --dataFile data.zip
 | `--entities a,b,c` | Table logical names |
 | `--solution <uniquename>` | Add every table in the solution |
 | `--out <path>` | Output file (default `data_schema.xml`) |
-| `--exclude-fields a,b` | Drop these columns from every table |
+| `--exclude-fields a,b` | Drop these columns from every table (wins over any include) |
+| `--include-fields a,b` | Keep these columns even when read-only |
+| `--include-audit` | Keep `createdon`, `createdby`, `modifiedon`, `modifiedby` and the `...onbehalfby` columns |
 | `--no-owner` | Drop `ownerid` (use when user GUIDs differ across environments) |
 | `--all-m2m` | Include N:N relationships whose other table is not in the schema |
 | `--disable-plugins` | Set `disableplugins="true"` on every entity |
@@ -71,6 +73,13 @@ update and is not a shadow column (`AttributeOf`).
 
 Excluded automatically: system audit columns (`createdon`, `modifiedby`,
 `versionnumber`, ...), calculated and rollup columns, and shadow name columns.
+Use `--include-audit` or `--include-fields` to keep them in the export.
+
+Dataverse ignores audit columns on import: the target records get the import
+user and the import time. To keep the original created date, the data must
+carry `overriddencreatedon`, which is writable and included by default.
+`createdby`, `modifiedon`, and `modifiedby` cannot be preserved through the
+Web API.
 
 Skipped with a warning: multi-select choice, file, image, and other types
 without a known CMT schema type.
